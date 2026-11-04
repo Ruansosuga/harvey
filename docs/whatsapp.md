@@ -41,35 +41,27 @@ business at all is yours to judge.
 ## Setup
 
 1. Have WA-AKG running with a session connected (QR code scanned).
-2. In WA-AKG, create an API key: Dashboard → Settings → API Keys.
-3. Put the gateway and key in `.env`:
+2. In WA-AKG, create an API key: Settings → API Keys (it starts with `wag_`).
+3. Run the guided setup and answer its three questions:
 
-   ```
-   WA_AKG_URL=http://localhost:3000
-   WA_AKG_API_KEY=wag_...
-   ```
-
-4. Turn the channel on in `harvey.yaml` (or `harvey.local.yaml` if you trained
-   Harvey, since that file wins):
-
-   ```yaml
-   channels:
-     whatsapp:
-       enabled: true
-       session: "sales-01"        # the WA-AKG session id
-       default_country_code: "55"
-       answer_inbound: true
-       auto_prospect: false
-       max_daily_cold: 15
+   ```bash
+   harvey whatsapp setup
    ```
 
-5. Check the connection:
+   It asks for the address you open WA-AKG's dashboard on, the API key
+   (hidden as you paste it) and which WhatsApp number to use, checks them
+   against WA-AKG, and only then saves: `WA_AKG_URL` and `WA_AKG_API_KEY` in
+   `.env`, and `channels.whatsapp.enabled` and `session` in the config file
+   (`harvey.local.yaml` if you trained Harvey, else `harvey.yaml`). If
+   something is wrong it says what, and saves nothing.
+
+4. Check the connection:
 
    ```bash
    harvey whatsapp test
    ```
 
-6. Turn found companies into WhatsApp contacts by hand the first time:
+5. Turn found companies into WhatsApp contacts by hand the first time:
 
    ```bash
    harvey whatsapp prospects --limit 20
@@ -77,7 +69,19 @@ business at all is yours to judge.
 
    With `auto_prospect: true`, Harvey does this every cycle.
 
-7. Start Harvey (`harvey run`). Drafts appear in the dashboard Outbox.
+6. Start Harvey (`harvey run`). Drafts appear in the dashboard Outbox.
+
+To set it up by hand instead, put `WA_AKG_URL=` and `WA_AKG_API_KEY=` in
+`.env` and set `channels.whatsapp.enabled: true` and `session:` in the config.
+
+**If it fails:**
+
+| Message | Fix |
+|---|---|
+| Couldn't reach … | WA-AKG isn't running, or the address is wrong. `localhost` only works when Harvey and WA-AKG run on the same machine. |
+| refused the API key | Create a new key in WA-AKG → Settings → API Keys and paste all of it. |
+| answered, but not like WA-AKG / isn't WA-AKG's API | Use the dashboard's address without any path, e.g. `https://wa.example.com`. |
+| no WhatsApp session yet | Add a session in WA-AKG and scan the QR code with the phone. |
 
 WhatsApp works with any email provider except Instantly, or on its own. With
 Instantly as the email provider, only WhatsApp goes through the outbox.

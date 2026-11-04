@@ -481,6 +481,13 @@ def cmd_whatsapp(args):
     with a phone into WhatsApp contacts."""
     from harvey.config import load_config, load_env
 
+    if args.whatsapp_action == "setup":
+        import getpass
+        from harvey.dashboard import _read_env_file
+        from harvey.integrations.whatsapp import run_setup
+        ok = asyncio.run(run_setup(input, getpass.getpass, print, _read_env_file()))
+        sys.exit(0 if ok else 1)
+
     config, env = load_config(), load_env()
     wa = config.channels.whatsapp
 
@@ -1107,8 +1114,9 @@ def main():
 
     # harvey whatsapp test|prospects
     sub = subparsers.add_parser("whatsapp", help="WhatsApp channel (WA-AKG)")
-    sub.add_argument("whatsapp_action", choices=["test", "prospects"],
-                     help="test: check WA-AKG and the session; prospects: turn "
+    sub.add_argument("whatsapp_action", choices=["setup", "test", "prospects"],
+                     help="setup: save the WA-AKG address, key and session; "
+                          "test: check WA-AKG and the session; prospects: turn "
                           "found companies with a phone into WhatsApp contacts")
     sub.add_argument("--limit", type=int, default=50,
                      help="prospects: phone numbers to check (default 50)")

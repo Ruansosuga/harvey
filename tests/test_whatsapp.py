@@ -413,3 +413,104 @@ def test_config_reads_a_whatsapp_section():
         "enabled": True, "session": "sales-01", "default_country_code": "+55"}})
     assert channels.whatsapp.enabled and channels.whatsapp.default_country_code == "55"
     assert ChannelsConfig.model_validate({"whatsapp": None}).whatsapp.enabled is False
+
+
+# ── Guided setup ──
+
+@pytest.mark.parametrize("raw,expected", [
+    ("wa.example.com", "https://wa.example.com"),
+    ("https://wa.example.com/dashboard/sessions", "https://wa.example.com"),
+    ("http://localhost:3000/api/", "http://localhost:3000"),
+    ("localhost:3000", "http://localhost:3000"),
+    ("192.0.2.10:3000", "http://192.0.2.10:3000"),
+    ("  'https://wa.example.com/'  ", "https://wa.example.com"),
+    ("", ""),
+])
+def test_pasted_addresses_become_the_gateway_base(raw, expected):
+    from harvey.integrations.whatsapp import normalize_gateway_url
+    assert normalize_gateway_url(raw) == expected
+
+
+class _Answers:
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.asked = []
+
+    def __call__(self, prompt):
+        self.asked.append(prompt)
+        return self.answers.pop(0) if self.answers else ""
+
+
+def _setup_files(tmp_path):
+    config = tmp_path / "harvey.yaml"
+    config.write_text(open("harvey.yaml", encoding="utf-8").read(), encoding="utf-8")
+    saved = {}
+    return config, saved
+
+
+async def _run(gateway_handler, tmp_path, url="wa.example.com", key="wag_test", pick="1",
+               env_values=None):
+    from harvey.integrations.whatsapp import run_setup
+    config, saved = _setup_files(tmp_path)
+    out = []
+    ok = await run_setup(
+        _Answers(url, pick), _Answers(key), out.append, env_values or {},
+        config_path=config, transport=httpx.MockTransport(gateway_handler),
+        write_env=saved.update)
+    return ok, saved, config, "\n".join(out)
+
+
+@pytest.mark.asyncio
+async def test_setup_saves_the_address_key_and_session(gateway, tmp_path):
+    ok, saved, config, out = await _run(gateway, tmp_path)
+    assert ok, out
+    assert saved == {"WA_AKG_URL": "https://wa.example.com", "WA_AKG_API_KEY": "wag_test"}
+    from harvey.config import load_config
+    loaded = load_config(str(config))
+    assert loaded.channels.whatsapp.enabled and loaded.channels.whatsapp.session == "sales-01"
+    assert "wag_test" not in out                      # the key is never echoed
+
+
+@pytest.mark.asyncio
+async def test_a_refused_key_saves_nothing_and_says_where_to_get_one(tmp_path):
+    def refuse(request):
+        return httpx.Response(401, json={"status": False, "message": "Unauthorized"})
+    ok, saved, config, out = await _run(refuse, tmp_path, key="wag_wrong")
+    assert not ok and saved == {}
+    assert "API Keys" in out
+    assert "enabled: false" in config.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_localhost_explains_why(tmp_path):
+    def down(request):
+        raise httpx.ConnectError("refused", request=request)
+    ok, saved, _, out = await _run(down, tmp_path, url="localhost:3000")
+    assert not ok and saved == {}
+    assert "Couldn't reach" in out and "same machine" in out
+
+
+@pytest.mark.asyncio
+async def test_a_web_page_instead_of_the_api_is_named(tmp_path):
+    def page(request):
+        return httpx.Response(200, text="<html>login</html>")
+    ok, saved, _, out = await _run(page, tmp_path)
+    assert not ok and saved == {}
+    assert "isn't WA-AKG's API" in out
+
+
+@pytest.mark.asyncio
+async def test_no_session_yet_says_to_scan_the_qr_code(tmp_path):
+    def empty(request):
+        return httpx.Response(200, json={"status": True, "data": []})
+    ok, saved, _, out = await _run(empty, tmp_path)
+    assert not ok and saved == {}
+    assert "QR code" in out
+
+
+@pytest.mark.asyncio
+async def test_enter_keeps_the_saved_address_and_key(gateway, tmp_path):
+    ok, saved, _, _ = await _run(
+        gateway, tmp_path, url="", key="",
+        env_values={"WA_AKG_URL": "https://wa.example.com", "WA_AKG_API_KEY": "wag_test"})
+    assert ok and saved["WA_AKG_API_KEY"] == "wag_test"

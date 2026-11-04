@@ -208,6 +208,8 @@ class WaAkgClient:
             raise WhatsAppError(f"WA-AKG {method} {path.split('?')[0]}: "
                                 f"HTTP {resp.status_code} {detail}".strip(),
                                 status=resp.status_code)
+        if data is None:
+            raise ValueError(f"WA-AKG {method} {path}: the answer isn't JSON")
         if isinstance(data, dict) and data.get("status") is False:
             raise WhatsAppError(f"WA-AKG {method} {path}: {data.get('message') or 'failed'}")
         return data
@@ -253,10 +255,13 @@ class WaAkgClient:
                     found[_DIGITS.sub("", str(r["number"]))] = str(r.get("jid") or "")
         return found
 
-    async def session_info(self) -> dict:
+    async def list_sessions(self) -> list[dict]:
         data = self._data(await self._request("GET", "/sessions"))
-        for s in data if isinstance(data, list) else []:
-            if isinstance(s, dict) and s.get("sessionId") == self.session:
+        return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
+
+    async def session_info(self) -> dict:
+        for s in await self.list_sessions():
+            if s.get("sessionId") == self.session:
                 return s
         raise WhatsAppError(f"WA-AKG has no session named '{self.session}'")
 
@@ -576,3 +581,135 @@ def inbound_prospect(address: str, push_name: str = ""):
         source=WA_INBOUND_SOURCE,
         status="contacted",
     )
+
+
+# ── Guided setup (harvey whatsapp setup) ─────────────────────────────────
+
+
+def normalize_gateway_url(raw: str) -> str:
+    """What people paste, as the gateway's base address: "meu-wa.example"
+    becomes "https://meu-wa.example", a dashboard page or /api is cut off."""
+    url = (raw or "").strip().strip("'\"").rstrip("/")
+    if not url:
+        return ""
+    if "://" not in url:
+        local = url.split(":")[0].split("/")[0]
+        local_like = local in ("localhost", "127.0.0.1", "0.0.0.0") or \
+            re.fullmatch(r"\d+\.\d+\.\d+\.\d+", local) is not None
+        url = ("http://" if local_like else "https://") + url
+    parsed = httpx.URL(url)
+    return f"{parsed.scheme}://{parsed.netloc.decode()}"
+
+
+def explain_gateway_error(e: Exception, url: str) -> str:
+    """A WA-AKG failure in plain words, with what to try."""
+    if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+        tip = ""
+        if "localhost" in url or "127.0.0.1" in url:
+            tip = (" localhost only works when Harvey runs on the same machine as"
+                   " WA-AKG; otherwise use that server's address.")
+        return f"Couldn't reach {url}. Is WA-AKG running, and is the address right?{tip}"
+    if isinstance(e, httpx.TimeoutException):
+        return f"{url} didn't answer in time. Check the address and that WA-AKG is up."
+    if isinstance(e, WhatsAppError):
+        if e.status in (401, 403):
+            return ("WA-AKG refused the API key. Create one in WA-AKG → Settings → "
+                    "API Keys and copy all of it (it starts with wag_).")
+        if e.status == 404:
+            return (f"{url} answered, but not like WA-AKG. Use the address you open "
+                    "the WA-AKG dashboard on, without /dashboard at the end.")
+        return f"WA-AKG answered with an error: {e}"
+    if isinstance(e, ValueError):
+        return (f"{url} answered with something that isn't WA-AKG's API (a web page?). "
+                "Use the address you open the WA-AKG dashboard on.")
+    return f"Something went wrong talking to WA-AKG: {e}"
+
+
+async def run_setup(ask, ask_secret, say, env_values: dict, config_path=None,
+                    transport: httpx.AsyncBaseTransport | None = None,
+                    write_env=None) -> bool:
+    """Ask for the gateway address and API key, check them against WA-AKG,
+    let the user pick a session, then save: the address and key in .env,
+    channels.whatsapp.enabled and .session in the config file. Nothing is
+    saved until WA-AKG accepted the key. True when everything was saved."""
+    from harvey.config import ConfigError, set_whatsapp_channel
+
+    current_url = env_values.get("WA_AKG_URL", "")
+    current_key = env_values.get("WA_AKG_API_KEY", "")
+
+    say("\n  WhatsApp setup (WA-AKG)\n")
+    say("  1. The WA-AKG address: the one you open its dashboard on,")
+    say("     e.g. https://wa.example.com or http://localhost:3000.")
+    hint = f" [{current_url}]" if current_url else ""
+    url = normalize_gateway_url(ask(f"  WA-AKG address{hint}: ") or current_url)
+    if not url:
+        say("\n  No address given; nothing was changed.\n")
+        return False
+
+    say("\n  2. The API key: in WA-AKG, Settings → API Keys → create one,")
+    say("     and copy all of it (it starts with wag_). It won't show as you paste.")
+    hint = " [Enter keeps the saved one]" if current_key else ""
+    key = (ask_secret(f"  API key{hint}: ") or current_key).strip()
+    if not key:
+        say("\n  No API key given; nothing was changed.\n")
+        return False
+    if not key.startswith("wag_"):
+        say("  (That key doesn't start with wag_; trying it anyway.)")
+
+    say(f"\n  Checking {url} ...")
+    client = WaAkgClient(url, key, "", transport=transport, timeout=15.0)
+    try:
+        sessions = await client.list_sessions()
+    except (WhatsAppError, httpx.HTTPError, ValueError) as e:
+        say(f"\n  ✗ {explain_gateway_error(e, url)}")
+        say("  Nothing was changed. Run `harvey whatsapp setup` again to retry.\n")
+        return False
+    say("  ✓ WA-AKG accepted the key.")
+
+    if not sessions:
+        say("\n  WA-AKG has no WhatsApp session yet. In its dashboard, add a session")
+        say("  and scan the QR code with the phone, then run this again.\n")
+        return False
+
+    say("\n  3. Which WhatsApp number should Harvey use?")
+    for i, sess in enumerate(sessions, start=1):
+        status = str(sess.get("status") or "unknown")
+        mark = "connected" if status.upper() == "CONNECTED" else status.lower()
+        say(f"     {i}. {sess.get('name') or sess.get('sessionId')}  "
+            f"(id: {sess.get('sessionId')}, {mark})")
+    chosen = None
+    default = "1" if len(sessions) == 1 else ""
+    while chosen is None:
+        answer = (ask(f"  Number{' [1]' if default else ''}: ") or default).strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(sessions):
+            chosen = sessions[int(answer) - 1]
+        elif any(answer == str(s.get("sessionId")) for s in sessions):
+            chosen = next(s for s in sessions if answer == str(s.get("sessionId")))
+        elif not answer:
+            say("\n  No session chosen; nothing was changed.\n")
+            return False
+        else:
+            say(f"  Type a number from 1 to {len(sessions)}.")
+    session_id = str(chosen.get("sessionId") or "")
+
+    if write_env is None:
+        from harvey.dashboard import _write_env_file as write_env
+    try:
+        write_env({"WA_AKG_URL": url, "WA_AKG_API_KEY": key})
+    except OSError as e:
+        say(f"\n  ✗ Couldn't save .env: {e}\n")
+        return False
+    try:
+        written = set_whatsapp_channel(session_id, enabled=True, path=config_path)
+    except ConfigError as e:
+        say("\n  ✓ Address and key saved in .env.")
+        say(f"  ✗ {e}\n")
+        return False
+
+    say("\n  ✓ Saved: address and key in .env;")
+    say(f"    whatsapp enabled with session '{session_id}' in {written.name}.")
+    if str(chosen.get("status") or "").upper() != "CONNECTED":
+        say("\n  ! That number isn't connected right now. Open it in WA-AKG and scan")
+        say("    the QR code with the phone before Harvey can send or read.")
+    say("\n  Next: `harvey whatsapp test`, then `harvey run`.\n")
+    return True

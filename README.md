@@ -641,7 +641,7 @@ harvey trulyinbox connect    # connect TrulyInbox so Harvey reads the mailbox's 
 harvey retry-writes          # retry prospects the Writer gave up on
 harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
-harvey whatsapp test|prospects  # WhatsApp via WA-AKG (docs/whatsapp.md)
+harvey whatsapp setup|test|prospects  # WhatsApp via WA-AKG (docs/whatsapp.md)
 ```
 
 Prospect CSV exports exclude opted-out contacts, including when using

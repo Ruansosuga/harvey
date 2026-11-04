@@ -1011,6 +1011,111 @@ def set_require_approval(value: bool, path=None) -> Path:
                       f"Set channels.email.require_approval: {word} there by hand.")
 
 
+_CHANNELS_KEY_RE = re.compile(r"^channels[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+_WHATSAPP_KEY_RE = re.compile(r"^(?P<ind>[ \t]+)whatsapp[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+
+
+def _child_indent(raw: str, key_end: int, parent: str) -> str:
+    """The indent of the first line under a key, or the parent's plus two."""
+    for line in raw[key_end:].split("\n")[1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = line[:len(line) - len(line.lstrip(" \t"))]
+        return indent if len(indent) > len(parent) else parent + "  "
+    return parent + "  "
+
+
+def _with_whatsapp_lines(raw: str, values: dict[str, str]) -> list[str]:
+    """Ways to write ``values`` (YAML scalars) under channels.whatsapp in
+    ``raw``: change or add the lines in an existing whatsapp: block, or add
+    a block under channels:."""
+    out = []
+    for m in _WHATSAPP_KEY_RE.finditer(raw):
+        child = _child_indent(raw, m.end(), m.group("ind"))
+        head, rest = raw[:m.end()], raw[m.end():]
+        lines = rest.split("\n")
+        block_end = len(lines)
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() and not line.lstrip().startswith("#"):
+                indent = len(line) - len(line.lstrip(" \t"))
+                if indent <= len(m.group("ind")):
+                    block_end = i
+                    break
+        block, after = lines[:block_end], lines[block_end:]
+        missing = dict(values)
+        for i, line in enumerate(block):
+            km = re.match(r"^(?P<lead>[ \t]+(?P<key>\w+)[ \t]*:[ \t]*)(?P<val>\"[^\"]*\"|'[^']*'|[^\s#]*)",
+                          line)
+            # Only the block's own keys, not a deeper one with the same name.
+            if km and km.group("key") in missing and line.startswith(child) \
+                    and not line[len(child):len(child) + 1].isspace():
+                lead = km.group("lead")
+                lead = lead if lead.endswith((" ", "\t")) else lead + " "
+                block[i] = lead + missing.pop(km.group("key")) + line[km.end("val"):]
+        added = [f"{child}{k}: {v}" for k, v in missing.items()]
+        out.append(head + "\n".join(block[:1] + added + block[1:] + after))
+    for m in _CHANNELS_KEY_RE.finditer(raw):
+        child = _child_indent(raw, m.end(), "")
+        block = "\n".join([f"{child}whatsapp:"]
+                          + [f"{child}  {k}: {v}" for k, v in values.items()])
+        out.append(raw[:m.end()] + "\n" + block + raw[m.end():])
+    return out
+
+
+def set_whatsapp_channel(session: str, enabled: bool = True, path=None) -> Path:
+    """Write channels.whatsapp.enabled and .session into the config file
+    Harvey reads (harvey.local.yaml wins). Comments and every other setting
+    stay as they are: the result must parse to the same settings apart from
+    these two, or nothing is written and ConfigError says to set them by hand."""
+    import copy
+    import json as _json
+    import shutil
+    path = Path(path or _find_config_file())
+    target = path.resolve()
+    data_bytes = target.read_bytes()
+    bom = data_bytes.startswith(b"\xef\xbb\xbf")
+    by_hand = (f"Set channels.whatsapp.enabled: {'true' if enabled else 'false'} and "
+               f"session: {_json.dumps(session)} in {path.name} by hand.")
+    try:
+        raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+        data = yaml.safe_load(raw)
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        raise ConfigError(f"{path.name} can't be rewritten safely ({e}). {by_hand}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path.name} isn't a settings file. {by_hand}")
+    expected = copy.deepcopy(data)
+    channels = expected.setdefault("channels", {})
+    if not isinstance(channels, dict):
+        raise ConfigError(f"{path.name}: channels isn't a section. {by_hand}")
+    wa = channels.get("whatsapp")
+    if not isinstance(wa, dict):
+        wa = {}
+        channels["whatsapp"] = wa
+    wa["enabled"] = bool(enabled)
+    wa["session"] = session
+    values = {"enabled": "true" if enabled else "false", "session": _json.dumps(session)}
+    if "channels" not in data:
+        raw = raw.rstrip("\n") + "\n\nchannels:\n"
+    for new in _with_whatsapp_lines(raw, values):
+        try:
+            if yaml.safe_load(new) != expected:
+                continue
+        except yaml.YAMLError:
+            continue
+        HarveyConfig(**expected)
+        if b"\r\n" in data_bytes:
+            new = new.replace("\n", "\r\n")
+        tmp = target.with_name(target.name + ".tmp")
+        try:
+            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            shutil.copymode(target, tmp)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return path
+    raise ConfigError(f"Couldn't change channels.whatsapp in {path.name} safely. {by_hand}")
+
+
 _mode_cache: dict[str, tuple[tuple, object]] = {}
 
 

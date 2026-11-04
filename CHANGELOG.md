@@ -16,7 +16,8 @@ minor versions can still change behaviour.
   caps and opt-out rules, with a separate cap on first messages
   (`max_daily_cold`), a chat-style writer and handler, a reply-SAIR opt-out
   line instead of the email footer, and Portuguese opt-out phrases.
-  `harvey whatsapp test|prospects`. See docs/whatsapp.md.
+  `harvey whatsapp setup` saves the gateway address, key and session after
+  checking them; `harvey whatsapp test|prospects`. See docs/whatsapp.md.
 - **Company fit and the company register.** The Companies tab now sorts by a
   0-100 fit score worked out from what Harvey already holds: the ICP sector
   match, a contact with a target title, the best email found, and an open
