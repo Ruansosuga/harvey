@@ -85,6 +85,19 @@ def sends_through_quiet_hours(config: HarveyConfig) -> bool:
                 and email.enabled and email.provider in NATIVE_PROVIDERS)
 
 
+async def _whatsapp_prospects(state, config, env) -> bool:
+    from harvey.integrations.whatsapp import prospect_companies
+    try:
+        result = await prospect_companies(state, config, env, limit=25)
+    except Exception as e:
+        logger.warning(f"WhatsApp prospecting failed: {e}")
+        return False
+    if result["added"]:
+        logger.info(f"WhatsApp: {result['added']} new contact(s) from "
+                    f"{result['checked']} phone number(s) checked.")
+    return True
+
+
 def seconds_until_quiet_hours_end(config: HarveyConfig) -> int:
     """Calculate seconds until quiet hours end."""
     qh = config.usage.quiet_hours
@@ -168,8 +181,10 @@ async def decide_next_action(
     email = getattr(getattr(config, "channels", None), "email", None)
     native_paused = (summary.get("sending_paused")
                      and getattr(email, "provider", "") != "instantly")
+    whatsapp = getattr(getattr(getattr(config, "channels", None), "whatsapp", None),
+                       "enabled", False) is True
     held = (legacy_sending_held(config) or native_paused
-            or not getattr(email, "enabled", True))
+            or not (getattr(email, "enabled", True) or whatsapp))
     deployable = 0 if held else draft_campaigns
 
     if deployable > 0:
@@ -423,6 +438,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # turns a name and a domain into something worth writing about.
             if summary.get("unprofiled", 0):
                 tasks.append(("profile", run_profile_stage(state, limit=25, config=config)))
+
+            # WhatsApp prospecting: found companies with a phone that's on
+            # WhatsApp become contacts. No model call; nothing is sent here.
+            wa = config.channels.whatsapp
+            if wa.enabled and wa.auto_prospect and not send_only:
+                tasks.append(("whatsapp_prospects", _whatsapp_prospects(state, config, env)))
 
             outcomes = await _run_agents(tasks)
 

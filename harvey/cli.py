@@ -476,6 +476,51 @@ def cmd_gmail(args):
         asyncio.run(_test())
 
 
+def cmd_whatsapp(args):
+    """WhatsApp via WA-AKG: test the connection, or turn found companies
+    with a phone into WhatsApp contacts."""
+    from harvey.config import load_config, load_env
+
+    if args.whatsapp_action == "setup":
+        import getpass
+        from harvey.dashboard import _read_env_file
+        from harvey.integrations.whatsapp import run_setup
+        ok = asyncio.run(run_setup(input, getpass.getpass, print, _read_env_file()))
+        sys.exit(0 if ok else 1)
+
+    config, env = load_config(), load_env()
+    wa = config.channels.whatsapp
+
+    if args.whatsapp_action == "test":
+        from harvey.integrations.whatsapp import WhatsAppProvider
+
+        async def _test():
+            ok, detail = await WhatsAppProvider(config, env).test_connection()
+            print(f"\n  {'✓' if ok else '✗'} WhatsApp: {detail}\n")
+            sys.exit(0 if ok else 1)
+        asyncio.run(_test())
+        return
+
+    if args.whatsapp_action == "prospects":
+        if not wa.enabled:
+            print("\n  WhatsApp is off: set channels.whatsapp.enabled: true first.\n")
+            sys.exit(1)
+        from harvey.integrations.whatsapp import prospect_companies
+        from harvey.state import StateManager
+
+        async def _prospects():
+            state = StateManager()
+            await state.init_db()
+            result = await prospect_companies(state, config, env, limit=args.limit)
+            print(f"\n  Checked {result['checked']} phone number(s): "
+                  f"{result['on_whatsapp']} on WhatsApp, {result['added']} new contact(s).")
+            if result["added"]:
+                print("  The writer drafts their first message next cycle; it waits "
+                      "in the Outbox for your approval.")
+            print()
+        asyncio.run(_prospects())
+
+
 def cmd_microsoft(args):
     """Microsoft 365 provider utilities (auth / test)."""
     from harvey.config import load_env
@@ -1066,6 +1111,16 @@ def main():
     sub.add_argument("microsoft_action", choices=["auth", "test"],
                      help="auth: one-time sign-in; test: verify connection")
     sub.set_defaults(func=cmd_microsoft)
+
+    # harvey whatsapp test|prospects
+    sub = subparsers.add_parser("whatsapp", help="WhatsApp channel (WA-AKG)")
+    sub.add_argument("whatsapp_action", choices=["setup", "test", "prospects"],
+                     help="setup: save the WA-AKG address, key and session; "
+                          "test: check WA-AKG and the session; prospects: turn "
+                          "found companies with a phone into WhatsApp contacts")
+    sub.add_argument("--limit", type=int, default=50,
+                     help="prospects: phone numbers to check (default 50)")
+    sub.set_defaults(func=cmd_whatsapp)
 
     # harvey outbox
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")

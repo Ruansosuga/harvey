@@ -22,7 +22,10 @@ from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import (
-    NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply,
+    NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply, uses_outbox,
+)
+from harvey.integrations.whatsapp import (
+    WHATSAPP_REPLY_RULES, inbound_prospect, is_wa_address,
 )
 from harvey.models.conversation import Conversation, Message
 from harvey.state import COLLEAGUE_REPLIED, REVIEW_NEXT_REPLY_KEY, StateManager
@@ -83,9 +86,13 @@ NO_THANKS_RE = re.compile(
 BARE_OPT_OUTS = {"stop", "unsubscribe", "remove", "remove me", "opt out",
                  "no thanks", "no thank you", "baja", "no gracias", "de baja", "dar de baja",
                  "darme de baja",
+                 # Portuguese (WhatsApp in Brazil): "SAIR" is what opt-out lines ask for.
+                 "sair", "pare", "parar", "descadastrar", "descadastre", "cancelar",
+                 "nao obrigado", "nao obrigada", "não obrigado", "não obrigada",
                  "הסר", "הסירו", "הסירי", "תסיר", "תסירו", "להסיר", "הסרה", "להסרה"}
 # Said around a bare opt-out without changing it ("הסר בבקשה", "הסר, תודה").
-_BARE_COURTESIES = {"בבקשה", "נא", "תודה", "רבה", "por", "favor", "gracias", "saludos"}
+_BARE_COURTESIES = {"בבקשה", "נא", "תודה", "רבה", "por", "favor", "gracias", "saludos",
+                    "obrigado", "obrigada", "valeu"}
 _MOBILE_SIGNATURE_RE = re.compile(
     r"^[ \t\u200e\u200f]*(?:sent from my \w[^\n]*|get outlook for \w[^\n]*"
     r"|sent from \w+ mail[^\n]*|נשלח מ[^\n]*|קבל(?:ו)? את outlook[^\n]*"
@@ -224,6 +231,56 @@ SPANISH_NO_THANKS_RE = re.compile(
     r"\bno,?[ \t]+(?:muchas[ \t]+)?gracias\b(?![ \t]+(?:a|por)\b)")
 
 
+# Portuguese opt-outs (WhatsApp, mostly Brazil), matched like the Spanish
+# ones: accent-free, a line at a time, the verb aimed at the sender. "Não me
+# manda mais" is an opt-out; "não me mandaram a proposta" is news.
+_PT_US = r"(?:me|nos)"
+_PT_LIST = (r"(?:(?:da|de|do|dessa|desta|sua|seu|essa|esta)\s+)*"
+            r"(?:lista|base|cadastro|contato|contatos|grupo|mailing|transmiss\w*)")
+_PT_SAY_END = r"(?=[ \t]*(?:[.!;]|$|,(?![ \t]*(?:mas|porem|exceto|a[ \t]+menos|se)(?!\w))))"
+PORTUGUESE_OPT_OUT_PATTERNS = (
+    # Take me off.
+    r"(?:me|nos)\s+(?:tir(?:e|em|a)|remov(?:a|am|e)|exclu(?:a|am|i)|descadastr(?:e|em|a)|apag(?:ue|uem|a))"
+    r"(?:\s+d[aeo]\s+" + _PT_LIST + "|" + _PT_SAY_END + ")",
+    r"(?:tir(?:e|em|a|ar)|remov(?:a|am|e|er)|exclu(?:a|am|i|ir)|descadastr(?:e|em|a|ar)|apag(?:ue|uem|a|ar))"
+    r"[- ](?:me|nos)(?:\s+d[aeo]\s+" + _PT_LIST + "|" + _PT_SAY_END + ")",
+    r"(?:tirar|remover|excluir|descadastrar|apagar)\s+(?:o\s+|a\s+)?(?:meu|minha|nosso|nossa)\s+"
+    r"(?:numero|contato|cadastro|nome|telefone|email|dados)",
+    r"descadastr(?:ar|e|em|a)\s+(?:me|nos)|quero\s+(?:me\s+)?descadastrar|(?:cancelar|cancela)\s+(?:a\s+)?inscricao",
+    # Don't write to / contact me (again).
+    r"nao\s+(?:" + _PT_US + r"\s+)?(?:mand(?:e|em|a)|envi(?:e|em|a)|cham(?:e|em|a)|procur(?:e|em|a)"
+    r"|contat(?:e|em|a)|incomod(?:e|em|a)|ligu(?:e|em)|perturb(?:e|em|a))\s+mais(?!\w)",
+    r"nao\s+" + _PT_US + r"\s+(?:procur(?:e|em)|contat(?:e|em)|incomod(?:e|em)|perturb(?:e|em))" + _PT_SAY_END,
+    r"(?:par(?:e|em|a)|deix(?:e|em|a))\s+de\s+(?:" + _PT_US + r"\s+)?"
+    r"(?:mandar|enviar|chamar|procurar|contatar|incomodar|ligar|perturbar|encher)",
+    r"nao\s+(?:quero|queremos|desejo|desejamos)\s+(?:mais\s+)?(?:receber|ser\s+contatad\w+)",
+    r"nao\s+(?:quero|queremos)\s+mais\s+(?:mensage\w+|propaganda|contato|nada)",
+    # Not interested, as the whole thought.
+    r"(?:nao\s+(?:tenho|temos)\s+(?:nenhum\s+)?interesse|nao\s+(?:estou|estamos|to|tou)\s+interessad[oa]s?"
+    r"|nao\s+(?:me|nos)\s+interessa)"
+    r"(?:\s+(?:no\s+momento|agora|por\s+enquanto|por\s+agora))?" + _PT_SAY_END,
+)
+PORTUGUESE_OPT_OUT_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(PORTUGUESE_OPT_OUT_PATTERNS) + r")(?!\w)", re.MULTILINE)
+# The word before negates or conditions it ("se não tenho interesse...").
+_PT_NOT_FINAL_BEFORE = {"se", "quando", "porque", "caso", "talvez", "ainda"}
+# "Não, obrigado": as with "no thanks". Not "por que não, obrigado" or "sim ou não".
+PORTUGUESE_NO_THANKS_RE = re.compile(
+    r"(?<!\bou )(?<!que )(?<!porque )(?<!ainda )"
+    r"\bnao,?[ \t]+(?:muito[ \t]+)?obrigad[oa]s?\b(?![ \t]+(?:a|por|pela|pelo)\b)")
+
+
+def _portuguese_opt_out(text: str):
+    """The first Portuguese opt-out phrase in _spanish_lines text that means it."""
+    for m in PORTUGUESE_OPT_OUT_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        last = _ES_LAST_WORD_RE.search(text[max(line_start, m.start() - 40):m.start()])
+        if last and last.group(1) in _PT_NOT_FINAL_BEFORE:
+            continue
+        return m
+    return None
+
+
 def _no_accents(text: str) -> str:
     """Accents dropped, for matching Spanish typed with or without them. Only
     Latin letters: combining marks are what spell Hebrew and others' words."""
@@ -340,9 +397,14 @@ def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
     if m:
         return {"rule": "phrase", "matched": m.group(0),
                 "why": f'Their reply contains "{m.group(0)}".'}
+    m = _portuguese_opt_out(_spanish_lines(their_text))
+    if m:
+        return {"rule": "phrase", "matched": m.group(0),
+                "why": f'Their reply contains "{m.group(0)}".'}
     for line in their_text.split("\n"):
         line = _flat(line)
-        m = SPANISH_NO_THANKS_RE.search(_no_accents(line))
+        m = (SPANISH_NO_THANKS_RE.search(_no_accents(line))
+             or PORTUGUESE_NO_THANKS_RE.search(_no_accents(line)))
         if m:
             return {"rule": "no_thanks", "matched": m.group(0),
                     "why": f'Their reply says "{m.group(0)}" (no thanks).'}
@@ -533,7 +595,7 @@ class Handler:
     @property
     def is_native(self) -> bool:
         return (
-            self.config.channels.email.provider in NATIVE_PROVIDERS
+            uses_outbox(self.config)
             and self.provider is not None
         )
 
@@ -784,7 +846,7 @@ class Handler:
                 id="",
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
-                channel="email",
+                channel="whatsapp" if is_wa_address(prospect.email) else "email",
                 intent=intent,
                 status="open",
             )
@@ -1017,6 +1079,8 @@ class Handler:
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
                 elif msg.body.strip():
+                    if is_wa_address(msg.from_email):
+                        await self._whatsapp_contact(msg)
                     await self._process_reply(
                         msg.from_email,
                         msg.body.strip(),
@@ -1051,6 +1115,27 @@ class Handler:
             # what wasn't handled is read again.
             self.provider.confirm_read()
         return complete
+
+    async def _whatsapp_contact(self, msg):
+        """Someone wrote to the WhatsApp number first: with
+        channels.whatsapp.answer_inbound on, they become a contact so their
+        message is answered like any reply. A name WhatsApp shows fills in
+        a contact that has none."""
+        existing = await self.state.get_prospect_by_email(msg.from_email)
+        if existing is not None:
+            return
+        wa = getattr(self.config.channels, "whatsapp", None)
+        if not getattr(wa, "answer_inbound", False):
+            logger.info("Handler: a new WhatsApp contact wrote in; "
+                        "channels.whatsapp.answer_inbound is off, so it's left for you.")
+            return
+        prospect = inbound_prospect(msg.from_email, (msg.headers or {}).get("push_name", ""))
+        await self.state.add_prospect(prospect)
+        await self.state.log_action(
+            action_type="whatsapp_inbound", agent="handler",
+            details={"prospect_email": msg.from_email},
+        )
+        logger.info("Handler: new WhatsApp contact wrote in; added as a prospect.")
 
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
@@ -1311,7 +1396,10 @@ Write a reply that:"""
 - Makes it easy for them to refer (one-line ask)
 - Under 50 words"""
 
-        prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
+        if is_wa_address(prospect.email):
+            prompt += WHATSAPP_REPLY_RULES
+        else:
+            prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
 
         response = await self.brain.think(
             prompt, session_id="harvey-handler",

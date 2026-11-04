@@ -9,6 +9,15 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **WhatsApp through WA-AKG.** With `channels.whatsapp.enabled`, Harvey
+  answers people who message a WhatsApp number and prospects found companies
+  whose phone is on WhatsApp, through a self-hosted WA-AKG gateway
+  (`WA_AKG_URL`, `WA_AKG_API_KEY`). Messages share the email outbox, approval,
+  caps and opt-out rules, with a separate cap on first messages
+  (`max_daily_cold`), a chat-style writer and handler, a reply-SAIR opt-out
+  line instead of the email footer, and Portuguese opt-out phrases.
+  `harvey whatsapp setup` saves the gateway address, key and session after
+  checking them; `harvey whatsapp test|prospects`. See docs/whatsapp.md.
 - **Company fit and the company register.** The Companies tab now sorts by a
   0-100 fit score worked out from what Harvey already holds: the ICP sector
   match, a contact with a target title, the best email found, and an open

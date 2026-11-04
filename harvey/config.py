@@ -314,7 +314,10 @@ def legacy_sending_held(config) -> bool:
     Instantly has no per-email approval queue, so with require_approval on
     Harvey holds campaign deployment and hands replies to a human.
     """
-    email = getattr(getattr(config, "channels", None), "email", None)
+    channels = getattr(config, "channels", None)
+    email = getattr(channels, "email", None)
+    if getattr(getattr(channels, "whatsapp", None), "enabled", False) is True:
+        return False   # WhatsApp sends through Harvey's own outbox
     return (getattr(email, "provider", "") == "instantly"
             and bool(getattr(email, "require_approval", True)))
 
@@ -337,9 +340,53 @@ class LinkedInChannelConfig(BaseModel):
     max_daily_messages: int = 10
 
 
+class WhatsAppChannelConfig(BaseModel):
+    """WhatsApp through a self-hosted WA-AKG gateway (WA_AKG_URL and
+    WA_AKG_API_KEY in .env). Messages go through the same outbox, approval
+    ladder, opt-out rules and send window as email."""
+    enabled: bool = False
+    # The WA-AKG session id (Dashboard → Sessions) whose number Harvey uses.
+    session: str = ""
+    # Added to phone numbers written without "+" (55 = Brazil).
+    default_country_code: str = "55"
+    # Answer people who write to the number first (they become contacts).
+    answer_inbound: bool = True
+    # Turn found companies with a phone into WhatsApp contacts every cycle
+    # (only numbers WA-AKG confirms are on WhatsApp). Off: run
+    # `harvey whatsapp prospects` by hand.
+    auto_prospect: bool = False
+    # First (cold) WhatsApp messages per day, inside channels.email's
+    # overall caps. Unofficial WhatsApp gateways get numbers banned for
+    # volume: keep this low, and raise it slowly.
+    max_daily_cold: int = 15
+    # How far back a chat is read for new messages.
+    lookback_hours: int = 48
+    # Added under every first (cold) WhatsApp message. "SAIR" and the other
+    # Portuguese opt-outs are honoured automatically.
+    opt_out_line: str = "Se não quiser mais receber mensagens, é só responder SAIR."
+
+    @field_validator("max_daily_cold", "lookback_hours")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("default_country_code", mode="before")
+    @classmethod
+    def _cc_text(cls, v):
+        return "".join(ch for ch in str(v if v is not None else "") if ch.isdigit())
+
+
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+    whatsapp: WhatsAppChannelConfig = WhatsAppChannelConfig()
+
+    @field_validator("whatsapp", mode="before")
+    @classmethod
+    def _blank_whatsapp(cls, v):
+        return WhatsAppChannelConfig() if v is None else v
 
 
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
@@ -758,6 +805,9 @@ class EnvConfig(BaseModel):
     m365_tenant_id: str = ""
     # Optional: only used when compliance.precleared.enabled is true.
     precleared_api_key: str = ""
+    # WhatsApp via WA-AKG (channels.whatsapp.enabled)
+    wa_akg_url: str = ""
+    wa_akg_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -873,6 +923,8 @@ def load_env() -> EnvConfig:
         m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
         m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
+        wa_akg_url=os.getenv("WA_AKG_URL", "").strip(),
+        wa_akg_api_key=os.getenv("WA_AKG_API_KEY", "").strip(),
     )
     return env
 
@@ -957,6 +1009,111 @@ def set_require_approval(value: bool, path=None) -> Path:
         return path
     raise ConfigError(f"Couldn't change require_approval in {path.name} safely. "
                       f"Set channels.email.require_approval: {word} there by hand.")
+
+
+_CHANNELS_KEY_RE = re.compile(r"^channels[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+_WHATSAPP_KEY_RE = re.compile(r"^(?P<ind>[ \t]+)whatsapp[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+
+
+def _child_indent(raw: str, key_end: int, parent: str) -> str:
+    """The indent of the first line under a key, or the parent's plus two."""
+    for line in raw[key_end:].split("\n")[1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = line[:len(line) - len(line.lstrip(" \t"))]
+        return indent if len(indent) > len(parent) else parent + "  "
+    return parent + "  "
+
+
+def _with_whatsapp_lines(raw: str, values: dict[str, str]) -> list[str]:
+    """Ways to write ``values`` (YAML scalars) under channels.whatsapp in
+    ``raw``: change or add the lines in an existing whatsapp: block, or add
+    a block under channels:."""
+    out = []
+    for m in _WHATSAPP_KEY_RE.finditer(raw):
+        child = _child_indent(raw, m.end(), m.group("ind"))
+        head, rest = raw[:m.end()], raw[m.end():]
+        lines = rest.split("\n")
+        block_end = len(lines)
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() and not line.lstrip().startswith("#"):
+                indent = len(line) - len(line.lstrip(" \t"))
+                if indent <= len(m.group("ind")):
+                    block_end = i
+                    break
+        block, after = lines[:block_end], lines[block_end:]
+        missing = dict(values)
+        for i, line in enumerate(block):
+            km = re.match(r"^(?P<lead>[ \t]+(?P<key>\w+)[ \t]*:[ \t]*)(?P<val>\"[^\"]*\"|'[^']*'|[^\s#]*)",
+                          line)
+            # Only the block's own keys, not a deeper one with the same name.
+            if km and km.group("key") in missing and line.startswith(child) \
+                    and not line[len(child):len(child) + 1].isspace():
+                lead = km.group("lead")
+                lead = lead if lead.endswith((" ", "\t")) else lead + " "
+                block[i] = lead + missing.pop(km.group("key")) + line[km.end("val"):]
+        added = [f"{child}{k}: {v}" for k, v in missing.items()]
+        out.append(head + "\n".join(block[:1] + added + block[1:] + after))
+    for m in _CHANNELS_KEY_RE.finditer(raw):
+        child = _child_indent(raw, m.end(), "")
+        block = "\n".join([f"{child}whatsapp:"]
+                          + [f"{child}  {k}: {v}" for k, v in values.items()])
+        out.append(raw[:m.end()] + "\n" + block + raw[m.end():])
+    return out
+
+
+def set_whatsapp_channel(session: str, enabled: bool = True, path=None) -> Path:
+    """Write channels.whatsapp.enabled and .session into the config file
+    Harvey reads (harvey.local.yaml wins). Comments and every other setting
+    stay as they are: the result must parse to the same settings apart from
+    these two, or nothing is written and ConfigError says to set them by hand."""
+    import copy
+    import json as _json
+    import shutil
+    path = Path(path or _find_config_file())
+    target = path.resolve()
+    data_bytes = target.read_bytes()
+    bom = data_bytes.startswith(b"\xef\xbb\xbf")
+    by_hand = (f"Set channels.whatsapp.enabled: {'true' if enabled else 'false'} and "
+               f"session: {_json.dumps(session)} in {path.name} by hand.")
+    try:
+        raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+        data = yaml.safe_load(raw)
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        raise ConfigError(f"{path.name} can't be rewritten safely ({e}). {by_hand}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path.name} isn't a settings file. {by_hand}")
+    expected = copy.deepcopy(data)
+    channels = expected.setdefault("channels", {})
+    if not isinstance(channels, dict):
+        raise ConfigError(f"{path.name}: channels isn't a section. {by_hand}")
+    wa = channels.get("whatsapp")
+    if not isinstance(wa, dict):
+        wa = {}
+        channels["whatsapp"] = wa
+    wa["enabled"] = bool(enabled)
+    wa["session"] = session
+    values = {"enabled": "true" if enabled else "false", "session": _json.dumps(session)}
+    if "channels" not in data:
+        raw = raw.rstrip("\n") + "\n\nchannels:\n"
+    for new in _with_whatsapp_lines(raw, values):
+        try:
+            if yaml.safe_load(new) != expected:
+                continue
+        except yaml.YAMLError:
+            continue
+        HarveyConfig(**expected)
+        if b"\r\n" in data_bytes:
+            new = new.replace("\n", "\r\n")
+        tmp = target.with_name(target.name + ".tmp")
+        try:
+            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            shutil.copymode(target, tmp)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return path
+    raise ConfigError(f"Couldn't change channels.whatsapp in {path.name} safely. {by_hand}")
 
 
 _mode_cache: dict[str, tuple[tuple, object]] = {}

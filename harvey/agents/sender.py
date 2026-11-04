@@ -25,7 +25,8 @@ from harvey.config import (
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider, uses_outbox
+from harvey.integrations.whatsapp import WA_DOMAIN, WA_UNAVAILABLE, RoutedProvider, is_wa_address
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
 from harvey.integrations.signature import signature_problem
 from harvey.sending_mode import SIGNATURE_HOLD_PREFIX, sync_sending_mode
@@ -111,7 +112,7 @@ class Sender:
     @property
     def is_native(self) -> bool:
         return (
-            self.config.channels.email.provider in NATIVE_PROVIDERS
+            uses_outbox(self.config)
             and self.provider is not None
         )
 
@@ -574,6 +575,15 @@ class Sender:
 
         await self._drain_due()
 
+    def _email_side_ok(self) -> bool:
+        """Whether email (not WhatsApp) can be sent: the email channel is on
+        and a mailbox is behind the provider."""
+        if not self.config.channels.email.enabled:
+            return False
+        if isinstance(self.provider, RoutedProvider):
+            return self.provider.email is not None
+        return self.provider is not None
+
     def _render(self, text: str, prospect) -> str:
         """Fill merge variables. The pre-send gate rejects any leftovers."""
         replacements = {
@@ -628,6 +638,8 @@ class Sender:
                 continue
             if prospect.status not in SENDABLE_STATUSES:
                 continue
+            if not is_wa_address(email) and not self._email_side_ok():
+                continue          # WhatsApp only: no mailbox to email them from
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
@@ -699,8 +711,18 @@ class Sender:
     def _outgoing_body(self, item: dict) -> str:
         """The exact body that goes out: cold email gets the footer, replies don't."""
         if item["kind"] == "sequence":
+            if is_wa_address(item["to_email"]):
+                return self._with_whatsapp_opt_out(item["body"])
             return self._with_footer(item["body"])
         return item["body"]
+
+    def _with_whatsapp_opt_out(self, body: str) -> str:
+        """A first WhatsApp message carries a one-line way out instead of
+        the email footer (a postal address reads as spam in a chat)."""
+        line = (self.config.channels.whatsapp.opt_out_line or "").strip()
+        if not line or body.rstrip().endswith(line):
+            return body
+        return body.rstrip() + "\n\n" + line
 
     async def _follow_up_order(self, item: dict, prospect=None) -> str | tuple[str, str] | None:
         """For a follow-up: "wait" until the email before it went out and its
@@ -778,7 +800,8 @@ class Sender:
         gate = pre_send_check(
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
-            postal_address=compliance_of(self.config).postal_address,
+            postal_address=("" if is_wa_address(item["to_email"])
+                            else compliance_of(self.config).postal_address),
             do_not_contact=live_do_not_contact(self.config),
         )
         if not gate:
@@ -834,6 +857,15 @@ class Sender:
         cold_left = cold_cap - await self.state.count_outbox_sent_today(
             kind="sequence",
             since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
+        # First WhatsApp messages have their own, lower cap inside it.
+        wa = getattr(self.config.channels, "whatsapp", None)
+        wa_cold_left = 0
+        if wa is not None and wa.enabled:
+            wa_cold_left = wa.max_daily_cold - await self.state.count_outbox_sent_today(
+                kind="sequence",
+                since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat(),
+                to_domain=WA_DOMAIN)
+        sent_wa_cold = 0
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         # In quiet hours only cold email can go, so only cold email is
@@ -899,7 +931,13 @@ class Sender:
             if item["kind"] == "sequence" and sent_cold >= cold_left:
                 held_cold += 1
                 continue
-            needs_check = self.precleared is not None and item["kind"] == "sequence"
+            on_whatsapp = is_wa_address(item["to_email"])
+            if on_whatsapp and item["kind"] == "sequence" and sent_wa_cold >= wa_cold_left:
+                held_cold += 1
+                continue
+            # Precleared answers for email law, not for WhatsApp numbers.
+            needs_check = (self.precleared is not None and item["kind"] == "sequence"
+                           and not on_whatsapp)
 
             prospect = await self.state.get_prospect(item["prospect_id"])
             blocked = await self._blocked(item, prospect, allow_risky)
@@ -1045,6 +1083,13 @@ class Sender:
                 await self.state.note_sends_held(SIGNATURE_HOLD_PREFIX + result.error[10:].strip())
                 logger.warning(f"Sender: {result.error} — outbox is holding.")
                 break
+            if not result.ok and result.error.startswith(WA_UNAVAILABLE):
+                # WA-AKG is down or the number is logged out: nothing went
+                # out, so it waits for a later cycle instead of failing.
+                await self.state.update_outbox_item(item["id"], status="approved")
+                logger.warning(f"Sender: WhatsApp is unavailable, holding messages: {result.error}")
+                wa_cold_left = sent_wa_cold   # no more WhatsApp this cycle
+                continue
             if not result.ok:
                 await self.state.update_outbox_item(
                     item["id"], status="failed", error=result.error[:300]
@@ -1054,6 +1099,8 @@ class Sender:
             sent += 1
             if item["kind"] == "sequence":
                 sent_cold += 1
+                if on_whatsapp:
+                    sent_wa_cold += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             # A note that the check moved it back no longer applies.
             note = {"error": ""} if (item.get("error") or "").startswith(RECHECK_PREFIX) else {}
