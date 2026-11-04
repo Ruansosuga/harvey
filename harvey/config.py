@@ -314,7 +314,10 @@ def legacy_sending_held(config) -> bool:
     Instantly has no per-email approval queue, so with require_approval on
     Harvey holds campaign deployment and hands replies to a human.
     """
-    email = getattr(getattr(config, "channels", None), "email", None)
+    channels = getattr(config, "channels", None)
+    email = getattr(channels, "email", None)
+    if getattr(getattr(channels, "whatsapp", None), "enabled", False) is True:
+        return False   # WhatsApp sends through Harvey's own outbox
     return (getattr(email, "provider", "") == "instantly"
             and bool(getattr(email, "require_approval", True)))
 
@@ -337,9 +340,53 @@ class LinkedInChannelConfig(BaseModel):
     max_daily_messages: int = 10
 
 
+class WhatsAppChannelConfig(BaseModel):
+    """WhatsApp through a self-hosted WA-AKG gateway (WA_AKG_URL and
+    WA_AKG_API_KEY in .env). Messages go through the same outbox, approval
+    ladder, opt-out rules and send window as email."""
+    enabled: bool = False
+    # The WA-AKG session id (Dashboard → Sessions) whose number Harvey uses.
+    session: str = ""
+    # Added to phone numbers written without "+" (55 = Brazil).
+    default_country_code: str = "55"
+    # Answer people who write to the number first (they become contacts).
+    answer_inbound: bool = True
+    # Turn found companies with a phone into WhatsApp contacts every cycle
+    # (only numbers WA-AKG confirms are on WhatsApp). Off: run
+    # `harvey whatsapp prospects` by hand.
+    auto_prospect: bool = False
+    # First (cold) WhatsApp messages per day, inside channels.email's
+    # overall caps. Unofficial WhatsApp gateways get numbers banned for
+    # volume: keep this low, and raise it slowly.
+    max_daily_cold: int = 15
+    # How far back a chat is read for new messages.
+    lookback_hours: int = 48
+    # Added under every first (cold) WhatsApp message. "SAIR" and the other
+    # Portuguese opt-outs are honoured automatically.
+    opt_out_line: str = "Se não quiser mais receber mensagens, é só responder SAIR."
+
+    @field_validator("max_daily_cold", "lookback_hours")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("default_country_code", mode="before")
+    @classmethod
+    def _cc_text(cls, v):
+        return "".join(ch for ch in str(v if v is not None else "") if ch.isdigit())
+
+
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+    whatsapp: WhatsAppChannelConfig = WhatsAppChannelConfig()
+
+    @field_validator("whatsapp", mode="before")
+    @classmethod
+    def _blank_whatsapp(cls, v):
+        return WhatsAppChannelConfig() if v is None else v
 
 
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
@@ -758,6 +805,9 @@ class EnvConfig(BaseModel):
     m365_tenant_id: str = ""
     # Optional: only used when compliance.precleared.enabled is true.
     precleared_api_key: str = ""
+    # WhatsApp via WA-AKG (channels.whatsapp.enabled)
+    wa_akg_url: str = ""
+    wa_akg_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -873,6 +923,8 @@ def load_env() -> EnvConfig:
         m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
         m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
+        wa_akg_url=os.getenv("WA_AKG_URL", "").strip(),
+        wa_akg_api_key=os.getenv("WA_AKG_API_KEY", "").strip(),
     )
     return env
 

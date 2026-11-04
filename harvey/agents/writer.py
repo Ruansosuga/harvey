@@ -17,7 +17,8 @@ from datetime import datetime, timezone
 from harvey.brain import Brain
 from harvey.config import EmailRulesError, HarveyConfig, compliance_of, load_email_rules
 from harvey.humanize import humanize, humanizer_enabled
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+from harvey.integrations.mail_provider import NATIVE_PROVIDERS, uses_outbox
+from harvey.integrations.whatsapp import is_wa_address, whatsapp_writing_rules
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
 from harvey.sending_mode import sync_sending_mode
@@ -114,7 +115,7 @@ class Writer:
 
     @property
     def is_native(self) -> bool:
-        return self.config.channels.email.provider in NATIVE_PROVIDERS
+        return uses_outbox(self.config)
 
     async def run(self):
         """Create email campaigns for prospects that need outreach."""
@@ -191,7 +192,7 @@ class Writer:
             campaign = Campaign(
                 id="",
                 name=batch_name,
-                channel="email",
+                channel="whatsapp" if batch_name.endswith("whatsapp-outreach") else "email",
                 sequence=sequence,
                 prospect_ids=[p.id for p in prospects],
                 status="draft",
@@ -428,6 +429,8 @@ Requirements:
 {strict}{inbox_rule}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
+        if is_wa_address(prospect.email):
+            prompt += whatsapp_writing_rules(prospect.email, self.config, sequence=False)
 
         result = await self.brain.think_json(
             prompt, session_id="harvey-writer",
@@ -449,7 +452,9 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             + (f" | Notes: {p.personalization_notes}" if p.personalization_notes else "")
             for p in prospects[:5]  # Show sample for context
         )
-        inbox_batch = all(p.is_company_inbox for p in prospects)
+        wa_batch = bool(prospects) and all(is_wa_address(p.email) for p in prospects)
+        # A WhatsApp contact found from a company's phone has no name either.
+        inbox_batch = all(p.is_company_inbox for p in prospects) or wa_batch
         if inbox_batch:
             merge_rule = (
                 "- These go to each company's general inbox, so no names are known.\n"
@@ -529,6 +534,8 @@ Return ONLY a JSON array (no markdown fences, no commentary):
   {{"step": 2, "subject": "...", "body": "...", "delay_days": 3}},
   {{"step": 3, "subject": "...", "body": "...", "delay_days": 4}}
 ]"""
+        if wa_batch:
+            prompt += whatsapp_writing_rules(prospects[0].email, self.config, sequence=True)
 
         result = await self.brain.think_json(
             prompt, session_id="harvey-writer",
@@ -611,7 +618,10 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             industry = prospect.industry or "general"
             # Inbox prospects get their own campaign: their templates can't
             # greet anyone by name.
-            kind = "inbox-outreach" if prospect.is_company_inbox else "outreach"
+            if is_wa_address(prospect.email):
+                kind = "whatsapp-outreach"   # chat-style messages, their own campaign
+            else:
+                kind = "inbox-outreach" if prospect.is_company_inbox else "outreach"
             key = f"{industry}-{kind}"
 
             if key not in batches:

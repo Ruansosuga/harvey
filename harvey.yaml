@@ -96,6 +96,17 @@ channels:
     enabled: false             # explicit opt-in; credentials alone do not enable it
     max_daily_connections: 20
     max_daily_messages: 10
+  # WhatsApp through a self-hosted WA-AKG gateway (docs/whatsapp.md).
+  # WA_AKG_URL and WA_AKG_API_KEY go in .env. Same outbox and approval as email.
+  whatsapp:
+    enabled: false
+    session: ""                # WA-AKG session id (Dashboard -> Sessions)
+    default_country_code: "55" # added to numbers written without "+"
+    answer_inbound: true       # people who write to the number first get answers
+    auto_prospect: false       # found companies with a WhatsApp number become contacts each cycle
+    max_daily_cold: 15         # first messages a day; keep it low (unofficial API, bans)
+    lookback_hours: 48
+    opt_out_line: "Se não quiser mais receber mensagens, é só responder SAIR."
 
 usage:
   max_daily_claude_percent: 80

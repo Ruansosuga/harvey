@@ -702,6 +702,20 @@ class StateManager:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None
 
+    async def companies_with_phone_and_no_contacts(self, limit: int = 150) -> list[Company]:
+        """Companies with a phone number and no prospect yet, newest first
+        (the WhatsApp channel turns these into contacts)."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM companies c
+                   WHERE COALESCE(c.phone, '') != ''
+                     AND NOT EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id)
+                   ORDER BY c.created_at DESC LIMIT ?""",
+                (max(1, int(limit)),),
+            ) as cursor:
+                return [self._company_from_row(r) for r in await cursor.fetchall()]
+
     async def get_company_by_domain(self, domain: str) -> Company | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -1430,9 +1444,11 @@ class StateManager:
                 return (await cursor.fetchone())[0]
 
     async def count_outbox_sent_today(self, kind: str | None = None,
-                                      since: str | None = None) -> int:
+                                      since: str | None = None,
+                                      to_domain: str | None = None) -> int:
         """Emails sent today (the UTC day, or since `since`, a naive UTC
-        ISO time); only one kind ("sequence", "reply") if given."""
+        ISO time); only one kind ("sequence", "reply") if given, and only
+        to addresses at `to_domain` if given."""
         if since:
             sql = "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND sent_at >= ?"
             params: tuple = (since,)
@@ -1443,6 +1459,9 @@ class StateManager:
         if kind:
             sql += " AND kind = ?"
             params += (kind,)
+        if to_domain:
+            sql += " AND lower(to_email) LIKE ?"
+            params += ("%@" + to_domain.lower(),)
         async with self._connect() as db:
             async with db.execute(sql, params) as cursor:
                 return (await cursor.fetchone())[0]

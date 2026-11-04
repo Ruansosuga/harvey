@@ -147,8 +147,31 @@ class MailProvider(ABC):
         """Cheap end-to-end credential check. Returns (ok, detail)."""
 
 
+def whatsapp_enabled(config) -> bool:
+    wa = getattr(getattr(config, "channels", None), "whatsapp", None)
+    return bool(getattr(wa, "enabled", False))
+
+
+def uses_outbox(config) -> bool:
+    """Whether Harvey sends through its own outbox: a native mailbox, or
+    WhatsApp (which always goes through the outbox, whatever the email
+    provider is)."""
+    email = config.channels.email
+    return email.provider in NATIVE_PROVIDERS or whatsapp_enabled(config)
+
+
 def get_mail_provider(config, env) -> MailProvider | None:
-    """Build the configured native provider, or None for instantly/unknown."""
+    """Build the configured native provider, or None for instantly/unknown.
+    With WhatsApp on, a provider that routes WhatsApp addresses there and
+    everything else to the mailbox."""
+    email = _email_provider(config, env)
+    if not whatsapp_enabled(config):
+        return email
+    from harvey.integrations.whatsapp import RoutedProvider, WhatsAppProvider
+    return RoutedProvider(email, WhatsAppProvider(config, env))
+
+
+def _email_provider(config, env) -> MailProvider | None:
     provider = (config.channels.email.provider or "").strip().lower()
     if provider == "gmail":
         from harvey.integrations.gmail import GmailProvider
